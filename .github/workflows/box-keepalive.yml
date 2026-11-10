@@ -1,0 +1,78 @@
+name: box-keepalive
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: box-keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wake box
+        env:
+          BOX_PERSONAL_KEY: ${{ secrets.BOX_PERSONAL_KEY }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+
+          ENDPOINT = "https://mcp.box.simular.ai/mcp"
+          KEY = os.environ.get("BOX_PERSONAL_KEY", "").strip()
+          if not KEY:
+              print("missing BOX_PERSONAL_KEY", file=sys.stderr)
+              sys.exit(1)
+
+          SID = None
+
+          def rpc(payload):
+              global SID
+              h = {
+                  "Content-Type": "application/json",
+                  "Accept": "application/json, text/event-stream",
+                  "Authorization": "Bearer " + KEY,
+                  "MCP-Protocol-Version": "2025-06-18",
+              }
+              if SID:
+                  h["Mcp-Session-Id"] = SID
+              req = urllib.request.Request(
+                  ENDPOINT, data=json.dumps(payload).encode(), headers=h, method="POST"
+              )
+              with urllib.request.urlopen(req, timeout=90) as r:
+                  sid = r.headers.get("Mcp-Session-Id") or r.headers.get("mcp-session-id")
+                  if sid:
+                      SID = sid
+                  return r.status, r.read().decode(errors="replace")
+
+          def body(raw):
+              if raw.startswith("event:") or "\ndata:" in raw:
+                  for line in raw.splitlines():
+                      if line.startswith("data:"):
+                          return line[5:].strip()
+              return raw
+
+          st, raw = rpc({
+              "jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                         "clientInfo": {"name": "gha-keepalive", "version": "1.0"}},
+          })
+          print("initialize:", st, "session:", (SID or "")[:12])
+          rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+          st, raw = rpc({
+              "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+              "params": {"name": "box_ensure", "arguments": {}},
+          })
+          d = json.loads(body(raw))
+          res = d.get("result", {})
+          print("box_ensure HTTP", st, "isError =", res.get("isError"))
+          for c in res.get("content", []):
+              if c.get("type") == "text":
+                  print(c["text"][:400])
+          if res.get("isError"):
+              sys.exit(1)
+          PY
